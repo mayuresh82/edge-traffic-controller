@@ -342,7 +342,7 @@ func (s *SFlowDatagram) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback)
 
 		default:
 			//return fmt.Errorf("Unsupported SFlow sample type %d", sampleType)
-      continue
+			continue
 		}
 	}
 	return nil
@@ -671,7 +671,7 @@ func decodeFlowSample(data *[]byte, expanded bool) (SFlowFlowSample, error) {
 				}
 			default:
 				//return s, fmt.Errorf("Unsupported flow record type: %d", flowRecordType)
-        continue
+				continue
 			}
 		} else {
 			skipRecord(data)
@@ -863,7 +863,7 @@ func decodeCounterSample(data *[]byte, expanded bool) (SFlowCounterSample, error
 			}
 		default:
 			//return s, fmt.Errorf("Invalid counter record type: %d", counterRecordType)
-      continue
+			continue
 		}
 	}
 	return s, nil
@@ -1074,7 +1074,16 @@ func decodeRawPacketFlowRecord(data *[]byte) (SFlowRawPacketFlowRecord, error) {
 	*data, rec.HeaderLength = (*data)[4:], binary.BigEndian.Uint32((*data)[:4])
 	headerLenWithPadding := int(rec.HeaderLength + ((4 - rec.HeaderLength) % 4))
 	*data, header = (*data)[headerLenWithPadding:], (*data)[:headerLenWithPadding]
-	rec.Header = gopacket.NewPacket(header, LayerTypeEthernet, gopacket.Default)
+	headerLayer := LayerTypeEthernet
+	switch rec.HeaderProtocol {
+	case SFlowProtoEthernet:
+		headerLayer = LayerTypeEthernet
+	case SFlowProtoIPv4:
+		headerLayer = LayerTypeIPv4
+	case SFlowProtoIPv6:
+		headerLayer = LayerTypeIPv6
+	}
+	rec.Header = gopacket.NewPacket(header, headerLayer, gopacket.Default)
 	return rec, nil
 }
 

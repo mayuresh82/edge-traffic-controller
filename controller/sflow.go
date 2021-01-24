@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net"
 	"sort"
@@ -13,112 +12,17 @@ import (
 	"github.com/google/gopacket/layers"
 )
 
-var WINDOW_SIZE = 2 * time.Minute
-
-type RouterIP string
-type IfIndex int
-type Prefix string
-
-// FlowSample represents a single flow sample
-type FlowSample struct {
-	AgentIP         net.IP
-	SampleRate      int
-	InputInterface  IfIndex
-	OutputInterface IfIndex
-	PacketSizeBytes int
-	SrcIP           net.IP
-	DstIP           net.IP
-	BgpNextHop      net.IP
-	BgpPeerAS       int
-	SrcMask         int
-	DstMask         int
-	Ts              time.Time
-}
-
-func (s FlowSample) DstPrefix() *net.IPNet {
-	cidr := fmt.Sprintf("%s/%d", s.DstIP.String(), s.DstMask)
-	_, ipnet, _ := net.ParseCIDR(cidr)
-	return ipnet
-}
-
-type FlowSamples []FlowSample
-
-// Rate returns aggregate bps of all samples in the slice
-func (f FlowSamples) Rate(sampleRate int, aggInterval time.Duration) int {
-	if len(f) == 0 {
-		return 0
-	}
-	var samplesInInterval FlowSamples
-	firstTs := f[len(f)-1].Ts
-	for i := len(f) - 1; i >= 0; i-- {
-		if f[i].Ts.Sub(firstTs) <= aggInterval {
-			samplesInInterval = append(samplesInInterval, f[i])
-		}
-	}
-	sumBytes := 0
-	for _, fs := range samplesInInterval {
-		sumBytes += fs.PacketSizeBytes
-	}
-	sumScaledBytes := sumBytes * sampleRate
-	bps := sumScaledBytes * 8 / int(aggInterval/time.Second)
-	return bps
-}
-
-type CounterSample struct {
-	AgentIP   net.IP
-	IfIndex   IfIndex
-	InOctets  int
-	OutOctets int
-	Speed     int
-	OutBps    int
-	Ts        time.Time
-}
-
-type CounterSamples []CounterSample
-
-func (c CounterSamples) Rate(aggInterval time.Duration) int {
-	if len(c) == 0 {
-		return 0
-	}
-	var samplesInInterval CounterSamples
-	firstTs := c[len(c)-1].Ts
-	for i := len(c) - 1; i >= 0; i-- {
-		if c[i].Ts.Sub(firstTs) <= aggInterval {
-			samplesInInterval = append(samplesInInterval, c[i])
-		}
-	}
-	sumBps := 0
-	for _, cs := range samplesInInterval {
-		sumBps += cs.OutBps
-	}
-	return sumBps / len(samplesInInterval)
-}
-
-type PrefixRate struct {
-	Prefix  *net.IPNet
-	RateBps int
-}
-
-func (p *PrefixRate) MarshalJSON() ([]byte, error) {
-	tmp := struct {
-		Prefix  string
-		RateBps int
-	}{
-		Prefix:  p.Prefix.String(),
-		RateBps: p.RateBps,
-	}
-	return json.Marshal(tmp)
-}
+var WINDOW_SIZE = 1 * time.Minute
+var CLEANUP_INTERVAL = 2 * time.Minute
 
 type SflowServer struct {
 	// buffer of flow samples per destination prefix per interface per router
-	samplesPerPrefix map[RouterIP]map[IfIndex]map[Prefix]FlowSamples
+	samplesPerPrefix map[RouterIP]map[IfIndex]map[Prefix]FsBuf
 	// moving out-bps traffic rates per interface per router
-	ratesPerIntf        map[RouterIP]map[IfIndex]CounterSamples
+	ratesPerIntf        map[RouterIP]map[IfIndex]CsBuf
 	fsChan              chan FlowSample
 	csChan              chan CounterSample
 	pktChan             chan *layers.SFlowDatagram
-	sampleRate          int
 	counterPollInterval time.Duration
 	mu                  sync.Mutex
 }
@@ -129,12 +33,11 @@ func NewSflowServer(conf SflowConfig) *SflowServer {
 	if err != nil {
 		glog.Exitf("Failed to bind UDP %d: %v", conf.ListenPort, err)
 	}
-	sampleMap := make(map[RouterIP]map[IfIndex]map[Prefix]FlowSamples)
-	ratesMap := make(map[RouterIP]map[IfIndex]CounterSamples)
+	sampleMap := make(map[RouterIP]map[IfIndex]map[Prefix]FsBuf)
+	ratesMap := make(map[RouterIP]map[IfIndex]CsBuf)
 	s := &SflowServer{
 		samplesPerPrefix:    sampleMap,
 		ratesPerIntf:        ratesMap,
-		sampleRate:          conf.SampleRate,
 		counterPollInterval: conf.CounterPollInterval,
 		fsChan:              make(chan FlowSample),
 		csChan:              make(chan CounterSample),
@@ -158,8 +61,7 @@ func NewSflowServer(conf SflowConfig) *SflowServer {
 }
 
 func (s *SflowServer) processSamples() {
-	var lastFsTs time.Time
-	var lastCsTs time.Time
+	cleanUpTicker := time.NewTicker(CLEANUP_INTERVAL)
 	for {
 		select {
 		case sample := <-s.fsChan:
@@ -169,33 +71,37 @@ func (s *SflowServer) processSamples() {
 			prefix := Prefix(sample.DstPrefix().String())
 			perRtrMap := s.samplesPerPrefix[routerIP]
 			if perRtrMap == nil {
-				perRtrMap = make(map[IfIndex]map[Prefix]FlowSamples)
+				perRtrMap = make(map[IfIndex]map[Prefix]FsBuf)
 			}
 			perIntfMap := perRtrMap[ifIndex]
 			if perIntfMap == nil {
-				perIntfMap = make(map[Prefix]FlowSamples)
+				perIntfMap = make(map[Prefix]FsBuf)
 			}
-			samplesPerPrefix := perIntfMap[prefix]
-			if len(samplesPerPrefix) == 0 {
-				lastFsTs = sample.Ts
+			buf := perIntfMap[prefix]
+			if len(buf.samples) == 0 {
+				buf.lastFsTs = sample.Ts
 			}
-			if len(samplesPerPrefix) > 0 {
-				if sample.Ts.Sub(lastFsTs) >= WINDOW_SIZE*2 {
+			if len(buf.samples) > 0 {
+				if sample.Ts.Sub(buf.lastFsTs) >= WINDOW_SIZE*2 {
 					// truncate the window by half
+					glog.V(4).Infof("Pre Trunc: %d samples", len(buf.samples))
 					truncIdx := 0
-					for i, sm := range samplesPerPrefix {
-						if sm.Ts.Sub(lastFsTs) >= WINDOW_SIZE {
+					for i, sm := range buf.samples {
+						if sm.Ts.Sub(buf.lastFsTs) >= WINDOW_SIZE {
 							truncIdx = i
 							break
 						}
 					}
-					samplesPerPrefix = samplesPerPrefix[truncIdx:]
-					lastFsTs = sample.Ts
+					glog.V(4).Infof("Trunc FS: sampleTS: %v, lastFsTs: %v, truncIdx: %d",
+						sample.Ts, buf.lastFsTs, truncIdx)
+					buf.samples = buf.samples[truncIdx:]
+					glog.V(4).Infof("Post Trunc: %d samples", len(buf.samples))
+					buf.lastFsTs = sample.Ts
 				}
 			}
-			glog.V(4).Infof("Adding flow sample: %+v", sample)
-			samplesPerPrefix = append(samplesPerPrefix, sample)
-			perIntfMap[prefix] = samplesPerPrefix
+			glog.V(6).Infof("Adding flow sample: %+v", sample)
+			buf.samples = append(buf.samples, sample)
+			perIntfMap[prefix] = buf
 			perRtrMap[ifIndex] = perIntfMap
 			s.samplesPerPrefix[routerIP] = perRtrMap
 			s.mu.Unlock()
@@ -205,33 +111,51 @@ func (s *SflowServer) processSamples() {
 			ifIndex := sample.IfIndex
 			perRtrMap := s.ratesPerIntf[routerIP]
 			if perRtrMap == nil {
-				perRtrMap = make(map[IfIndex]CounterSamples)
+				perRtrMap = make(map[IfIndex]CsBuf)
 			}
-			samplesPerIntf := perRtrMap[ifIndex]
-			if len(samplesPerIntf) == 0 {
-				lastCsTs = sample.Ts
+			buf := perRtrMap[ifIndex]
+			if len(buf.samples) == 0 {
+				buf.lastCsTs = sample.Ts
 			}
-			if len(samplesPerIntf) > 0 {
-				if sample.Ts.Sub(lastCsTs) >= WINDOW_SIZE*2 {
+			if len(buf.samples) > 0 {
+				if sample.Ts.Sub(buf.lastCsTs) >= WINDOW_SIZE*2 {
 					// truncate the window by half
 					truncIdx := 0
-					for i, sm := range samplesPerIntf {
-						if sm.Ts.Sub(lastCsTs) >= WINDOW_SIZE {
+					for i, sm := range buf.samples {
+						if sm.Ts.Sub(buf.lastCsTs) >= WINDOW_SIZE {
 							truncIdx = i
 							break
 						}
 					}
-					samplesPerIntf = samplesPerIntf[truncIdx:]
-					lastCsTs = sample.Ts
+					buf.samples = buf.samples[truncIdx:]
+					buf.lastCsTs = sample.Ts
 				}
-				prevSample := samplesPerIntf[len(samplesPerIntf)-1]
+				prevSample := buf.samples[len(buf.samples)-1]
 				rate := (sample.OutOctets - prevSample.OutOctets) * 8 / int(s.counterPollInterval/time.Second)
 				sample.OutBps = rate
 			}
-			glog.V(4).Infof("Adding counter sample: %+v", sample)
-			samplesPerIntf = append(samplesPerIntf, sample)
-			perRtrMap[ifIndex] = samplesPerIntf
+			glog.V(6).Infof("Adding counter sample: %+v", sample)
+			buf.samples = append(buf.samples, sample)
+			perRtrMap[ifIndex] = buf
 			s.ratesPerIntf[routerIP] = perRtrMap
+			s.mu.Unlock()
+		case <-cleanUpTicker.C:
+			s.mu.Lock()
+			for rip, ifs := range s.samplesPerPrefix {
+				for ifindex, prefixSamples := range ifs {
+					for prfx, buf := range prefixSamples {
+						if len(buf.samples) == 0 {
+							continue
+						}
+						// if the last sample is older than cleanup interval, clear them out
+						if time.Now().Sub(buf.samples[len(buf.samples)-1].Ts) >= CLEANUP_INTERVAL {
+							glog.V(2).Infof("Clean up samples for %v / %v / %v", rip, ifindex, prfx)
+							delete(s.samplesPerPrefix[rip][ifindex], prfx)
+							continue
+						}
+					}
+				}
+			}
 			s.mu.Unlock()
 		}
 	}
@@ -246,6 +170,8 @@ func (s *SflowServer) processPacket() {
 				SampleRate:      int(fs.SamplingRate),
 				InputInterface:  IfIndex(fs.InputInterface),
 				OutputInterface: IfIndex(fs.OutputInterface),
+				SrcMask:         24,
+				DstMask:         24,
 				Ts:              time.Now(),
 			}
 			for _, r := range fs.Records {
@@ -260,11 +186,14 @@ func (s *SflowServer) processPacket() {
 					sample.BgpNextHop = fr.NextHop
 					sample.BgpPeerAS = int(fr.PeerAS)
 				case layers.SFlowRawPacketFlowRecord:
+					sample.PacketSizeBytes = int(fr.FrameLength)
+					if err := fr.Header.ErrorLayer(); err != nil {
+						glog.Errorf("Error decoding some part of the packet:", err)
+					}
 					if ipLayer := fr.Header.Layer(layers.LayerTypeIPv4); ipLayer != nil {
 						ipHdr, _ := ipLayer.(*layers.IPv4)
 						sample.SrcIP = ipHdr.SrcIP
 						sample.DstIP = ipHdr.DstIP
-						sample.PacketSizeBytes = int(ipHdr.Length)
 					}
 				}
 			}
@@ -297,9 +226,9 @@ func (s *SflowServer) TopNPrefixesByRate(n int, routerIP RouterIP, ifIndex IfInd
 		glog.V(2).Infof("No samples found for %s / %d", routerIP, ifIndex)
 		return prefixRates
 	}
-	for prefix, samples := range intfSamples {
+	for prefix, buf := range intfSamples {
 		_, ipnet, _ := net.ParseCIDR(string(prefix))
-		prefixRate := PrefixRate{Prefix: ipnet, RateBps: samples.Rate(s.sampleRate, interval)}
+		prefixRate := PrefixRate{Prefix: ipnet, RateBps: buf.samples.Rate(interval)}
 		prefixRates = append(prefixRates, prefixRate)
 	}
 	sort.Slice(prefixRates, func(i, j int) bool {
@@ -322,7 +251,7 @@ func (s *SflowServer) ChildPrefixRates(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prefixRates := []PrefixRate{}
-	prefixSamples, ok := s.samplesPerPrefix[routerIP][ifIndex][parent]
+	buf, ok := s.samplesPerPrefix[routerIP][ifIndex][parent]
 	if !ok {
 		glog.V(2).Infof("No samples found for %s / %d / %s", routerIP, ifIndex, parent)
 		return prefixRates
@@ -330,12 +259,12 @@ func (s *SflowServer) ChildPrefixRates(
 	for _, c := range children {
 		_, ipnet, _ := net.ParseCIDR(string(c))
 		var samplesForChild FlowSamples
-		for _, sample := range prefixSamples {
+		for _, sample := range buf.samples {
 			if ipnet.Contains(sample.DstIP) {
 				samplesForChild = append(samplesForChild, sample)
 			}
 		}
-		prefixRate := PrefixRate{Prefix: ipnet, RateBps: samplesForChild.Rate(s.sampleRate, interval)}
+		prefixRate := PrefixRate{Prefix: ipnet, RateBps: samplesForChild.Rate(interval)}
 		prefixRates = append(prefixRates, prefixRate)
 	}
 	return prefixRates
@@ -345,9 +274,10 @@ func (s *SflowServer) ChildPrefixRates(
 func (s *SflowServer) InterfaceUtil(routerIP RouterIP, ifIndex IfIndex, interval time.Duration) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	samplesPerIntf, ok := s.ratesPerIntf[routerIP][ifIndex]
+	samplesBuf, ok := s.ratesPerIntf[routerIP][ifIndex]
 	if !ok {
+		glog.Infof("No samples found for router %s, ifindex %d", routerIP, ifIndex)
 		return 0
 	}
-	return samplesPerIntf.Rate(interval)
+	return samplesBuf.samples.Rate(interval)
 }
