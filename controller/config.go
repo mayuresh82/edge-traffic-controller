@@ -25,6 +25,7 @@ type InterfaceConfig struct {
 	Name               string
 	IfIndex            int `yaml:"ifindex"`
 	Speed              int
+	Address            string
 	HighWaterMark      int  `yaml:"high_watermark"`
 	LowWaterMark       int  `yaml:"low_watermark"`
 	PerPrefixThreshold int  `yaml:"per_prefix_threshold"`
@@ -32,10 +33,11 @@ type InterfaceConfig struct {
 }
 
 type DeviceConfig struct {
-	Name       string
-	IP         net.IP `yaml:"ip"`
-	ASN        int    `yaml:"asn"`
-	Interfaces []InterfaceConfig
+	Name         string
+	IP           net.IP `yaml:"ip"`
+	ASN          int    `yaml:"asn"`
+	BgpCommunity string `yaml:"bgp_community"`
+	Interfaces   []InterfaceConfig
 }
 
 type Config struct {
