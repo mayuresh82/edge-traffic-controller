@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/any"
@@ -33,6 +35,7 @@ type BgpRoute struct {
 	origin      Origin
 	med         int
 	bgpType     BgpType
+	communities []string
 	mpCandidate bool
 }
 
@@ -109,12 +112,17 @@ func apiPathToBgpRoute(p *api.Path) (BgpRoute, error) {
 					r.asPath = append(r.asPath, int(num))
 				}
 			}
+		case *api.CommunitiesAttribute:
+			for _, c := range v.Communities {
+				strComm := fmt.Sprintf("%v:%v", c>>16, c&65535)
+				r.communities = append(r.communities, strComm)
+			}
 		}
 	}
 	return r, nil
 }
 
-func apiPath(route BgpRoute) *api.Path {
+func bgpRouteToApiPath(route BgpRoute) *api.Path {
 	_, ipnet, _ := net.ParseCIDR(route.prefix)
 	afi := api.Family_AFI_IP
 	if ipnet.IP.To4() == nil {
@@ -134,7 +142,14 @@ func apiPath(route BgpRoute) *api.Path {
 	a3, _ := ptypes.MarshalAny(&api.LocalPrefAttribute{
 		LocalPref: uint32(route.lp),
 	})
-	attrs := []*any.Any{a1, a2, a3}
+	var communities []uint32
+	for _, comm := range route.communities {
+		communities = append(communities, convertCommunity(comm))
+	}
+	a4, _ := ptypes.MarshalAny(&api.CommunitiesAttribute{
+		Communities: communities,
+	})
+	attrs := []*any.Any{a1, a2, a3, a4}
 	return &api.Path{
 		Family: &api.Family{Afi: afi, Safi: api.Family_SAFI_UNICAST},
 		Nlri:   nlri,
@@ -174,4 +189,11 @@ func neighborDefinedSets(d *Device) []*api.DefinedSet {
 	ds2.List = []string{d.BgpCommunity}
 	dsList = append(dsList, ds1, ds2)
 	return dsList
+}
+
+func convertCommunity(comm string) uint32 {
+	parts := strings.Split(comm, ":")
+	first, _ := strconv.ParseUint(parts[0], 10, 32)
+	second, _ := strconv.ParseUint(parts[1], 10, 32)
+	return uint32(first)<<16 | uint32(second)
 }
