@@ -303,6 +303,7 @@ func (c *Controller) AddOverrides(d *Device, conf InterfaceConfig, overrides []P
 		for _, p := range sorted {
 			for _, intf := range d.Interfaces {
 				var found bool
+				// skip the current best path
 				for _, n := range intf.Nets {
 					if n.Contains(net.ParseIP(p.nh)) {
 						found = true
@@ -322,8 +323,10 @@ func (c *Controller) AddOverrides(d *Device, conf InterfaceConfig, overrides []P
 					continue
 				}
 				glog.Infof("Detouring %d bps for prefix %s to interface %s (nh %s)", o.RateBps, pfxStr, intf.Name, p.nh)
+				p.prefix = pfxStr
 				p.lp = 500 // inject with a high LP
 				p.origin = ORIGIN_IGP
+				p.communities = append(p.communities, d.BgpCommunity)
 				if _, err := c.BgpServer.AddPath(context.Background(), &api.AddPathRequest{Path: bgpRouteToApiPath(p)}); err != nil {
 					glog.Error(err)
 				}
