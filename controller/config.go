@@ -30,6 +30,7 @@ type InterfaceConfig struct {
 	LowWaterMark       int  `yaml:"low_watermark"`
 	PerPrefixThreshold int  `yaml:"per_prefix_threshold"`
 	DryRun             bool `yaml:"dry_run"`
+	Monitor            bool
 }
 
 type DeviceConfig struct {

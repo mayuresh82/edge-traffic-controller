@@ -28,35 +28,35 @@ const (
 )
 
 type BgpRoute struct {
-	prefix      string
-	nh          string
-	lp          int
-	asPath      []int
-	origin      Origin
-	med         int
-	bgpType     BgpType
-	communities []string
-	mpCandidate bool
+	Prefix      string
+	Nh          string
+	Lp          int
+	AsPath      []int `json:"as_path"`
+	Origin      Origin
+	Med         int
+	BgpType     BgpType `json:"bgp_type"`
+	Communities []string
+	MpCandidate bool `json:"mp_candidate"`
 }
 
 // stripped down version of BGP bestpath algorithm
 func SortPaths(paths []BgpRoute, multiPath bool, bestPath bool) []BgpRoute {
 	sort.Slice(paths, func(i, j int) bool {
-		if paths[i].lp > paths[j].lp {
+		if paths[i].Lp > paths[j].Lp {
 			return true
 		}
-		if len(paths[i].asPath) < len(paths[j].asPath) {
+		if len(paths[i].AsPath) < len(paths[j].AsPath) {
 			return true
 		}
-		if paths[i].origin < paths[j].origin {
+		if paths[i].Origin < paths[j].Origin {
 			return true
 		}
-		if paths[i].med < paths[j].med {
+		if paths[i].Med < paths[j].Med {
 			return true
 		}
 		if multiPath {
-			paths[i].mpCandidate = true
-			paths[j].mpCandidate = true
+			paths[i].MpCandidate = true
+			paths[j].MpCandidate = true
 			return true
 		}
 		return false
@@ -66,7 +66,7 @@ func SortPaths(paths []BgpRoute, multiPath bool, bestPath bool) []BgpRoute {
 	}
 	var bestPaths []BgpRoute
 	for _, p := range paths {
-		if multiPath && p.mpCandidate {
+		if multiPath && p.MpCandidate {
 			bestPaths = append(bestPaths, p)
 			continue
 		}
@@ -84,7 +84,7 @@ func apiPathToBgpRoute(p *api.Path) (BgpRoute, error) {
 	}
 	switch v := value.Message.(type) {
 	case *api.IPAddressPrefix:
-		r.prefix = fmt.Sprintf("%s/%d", v.Prefix, v.PrefixLen)
+		r.Prefix = fmt.Sprintf("%s/%d", v.Prefix, v.PrefixLen)
 	default:
 		return r, fmt.Errorf("Unsupported NLRI: %v", v)
 	}
@@ -95,13 +95,13 @@ func apiPathToBgpRoute(p *api.Path) (BgpRoute, error) {
 		}
 		switch v := val.Message.(type) {
 		case *api.NextHopAttribute:
-			r.nh = v.NextHop
+			r.Nh = v.NextHop
 		case *api.OriginAttribute:
-			r.origin = Origin(v.Origin)
+			r.Origin = Origin(v.Origin)
 		case *api.MultiExitDiscAttribute:
-			r.med = int(v.Med)
+			r.Med = int(v.Med)
 		case *api.LocalPrefAttribute:
-			r.lp = int(v.LocalPref)
+			r.Lp = int(v.LocalPref)
 		case *api.AsPathAttribute:
 			for _, seg := range v.Segments {
 				// as-sequence
@@ -109,13 +109,13 @@ func apiPathToBgpRoute(p *api.Path) (BgpRoute, error) {
 					continue
 				}
 				for _, num := range seg.Numbers {
-					r.asPath = append(r.asPath, int(num))
+					r.AsPath = append(r.AsPath, int(num))
 				}
 			}
 		case *api.CommunitiesAttribute:
 			for _, c := range v.Communities {
 				strComm := fmt.Sprintf("%v:%v", c>>16, c&65535)
-				r.communities = append(r.communities, strComm)
+				r.Communities = append(r.Communities, strComm)
 			}
 		}
 	}
@@ -123,7 +123,7 @@ func apiPathToBgpRoute(p *api.Path) (BgpRoute, error) {
 }
 
 func bgpRouteToApiPath(route BgpRoute) *api.Path {
-	_, ipnet, _ := net.ParseCIDR(route.prefix)
+	_, ipnet, _ := net.ParseCIDR(route.Prefix)
 	afi := api.Family_AFI_IP
 	if ipnet.IP.To4() == nil {
 		afi = api.Family_AFI_IP6
@@ -134,16 +134,16 @@ func bgpRouteToApiPath(route BgpRoute) *api.Path {
 		PrefixLen: uint32(prefixlen),
 	})
 	a1, _ := ptypes.MarshalAny(&api.OriginAttribute{
-		Origin: uint32(route.origin),
+		Origin: uint32(route.Origin),
 	})
 	a2, _ := ptypes.MarshalAny(&api.NextHopAttribute{
-		NextHop: route.nh,
+		NextHop: route.Nh,
 	})
 	a3, _ := ptypes.MarshalAny(&api.LocalPrefAttribute{
-		LocalPref: uint32(route.lp),
+		LocalPref: uint32(route.Lp),
 	})
 	var communities []uint32
-	for _, comm := range route.communities {
+	for _, comm := range route.Communities {
 		communities = append(communities, convertCommunity(comm))
 	}
 	a4, _ := ptypes.MarshalAny(&api.CommunitiesAttribute{
@@ -163,7 +163,7 @@ func neighborPolicy(d *Device) *api.Policy {
 		Name: "Match community and announce",
 		Conditions: &api.Conditions{
 			NeighborSet: &api.MatchSet{
-				MatchType: api.MatchType_ALL,
+				MatchType: api.MatchType_ANY,
 				Name:      d.Name,
 			},
 			CommunitySet: &api.MatchSet{
@@ -183,7 +183,7 @@ func neighborDefinedSets(d *Device) []*api.DefinedSet {
 	dsList := []*api.DefinedSet{}
 	ds1 := &api.DefinedSet{DefinedType: api.DefinedType_NEIGHBOR}
 	ds1.Name = d.Name
-	ds1.List = []string{d.IP.String()}
+	ds1.List = []string{d.IP.String() + "/32"}
 	ds2 := &api.DefinedSet{DefinedType: api.DefinedType_COMMUNITY}
 	ds2.Name = d.BgpCommunity
 	ds2.List = []string{d.BgpCommunity}

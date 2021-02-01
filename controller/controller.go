@@ -22,7 +22,7 @@ import (
 var (
 	configFile       = flag.String("config", "", "Path to config file")
 	httpAddr         = flag.String("http_addr", ":8080", "HTTP Server Addr")
-	MONITOR_INTERVAL = 2 * time.Minute
+	MONITOR_INTERVAL = 1 * time.Minute
 )
 
 type Device struct {
@@ -93,6 +93,15 @@ func NewController(config *Config) *Controller {
 			Name: d.Name, IP: d.IP, Interfaces: make(map[string]*Interface),
 			BgpCommunity: d.BgpCommunity,
 		}
+		for _, ds := range neighborDefinedSets(dev) {
+			if err := s.AddDefinedSet(ctx, &api.AddDefinedSetRequest{DefinedSet: ds}); err != nil {
+				glog.Exitf("Failed to add defined set: %v", err)
+			}
+		}
+		devPol := neighborPolicy(dev)
+		if err := s.AddPolicy(ctx, &api.AddPolicyRequest{Policy: devPol}); err != nil {
+			glog.Exitf("Failed to add policy: %v", err)
+		}
 		n := &api.Peer{
 			Conf: &api.PeerConf{
 				NeighborAddress: d.IP.String(),
@@ -103,7 +112,7 @@ func NewController(config *Config) *Controller {
 					DefaultAction: api.RouteAction_ACCEPT,
 				},
 				ExportPolicy: &api.PolicyAssignment{
-					Policies:      []*api.Policy{neighborPolicy(dev)},
+					Policies:      []*api.Policy{devPol},
 					DefaultAction: api.RouteAction_REJECT,
 				},
 			},
@@ -118,12 +127,6 @@ func NewController(config *Config) *Controller {
 		}
 		if err := s.AddPeer(ctx, &api.AddPeerRequest{Peer: n}); err != nil {
 			glog.Exitf("Failed to add peer %v", d.IP)
-			continue
-		}
-		for _, ds := range neighborDefinedSets(dev) {
-			if err := s.AddDefinedSet(ctx, &api.AddDefinedSetRequest{DefinedSet: ds}); err != nil {
-				glog.Exitf("Failed to add defined set: %v", err)
-			}
 		}
 		c.ControlledDevices[dev.Name] = dev
 	}
@@ -144,7 +147,9 @@ func (c *Controller) Start() {
 			intf.Nets = append(intf.Nets, ipnet)
 			dev := c.ControlledDevices[devConf.Name]
 			dev.Interfaces[intf.Name] = intf
-			go c.monitorLoop(dev, intConf)
+			if intConf.Monitor {
+				go c.monitorLoop(dev, intConf)
+			}
 		}
 	}
 	glog.Infof("Starting http server on %s", *httpAddr)
@@ -175,13 +180,13 @@ func (c *Controller) monitorLoop(d *Device, intfConf InterfaceConfig) {
 		ifindex := IfIndex(devIntf.IfIndex)
 		utilBps := c.SflowServer.InterfaceUtil(rip, ifindex, 1*time.Minute)
 		speedBps := devIntf.SpeedBps
-		percentUtil := utilBps / speedBps * 100
+		percentUtil := int(float64(utilBps) / float64(speedBps) * 100)
 		glog.Infof("%s/%s (Util: %d, speed: %d) is at %d%% utilization",
 			d.Name, intfConf.Name, utilBps, speedBps, percentUtil)
 
 		// check if interface already has previous overrides that should be removed
 		// This might occur if interface util has fallen below the low watermark
-		if utilBps <= intfConf.LowWaterMark/100*speedBps {
+		if percentUtil <= intfConf.LowWaterMark {
 			glog.Infof("Low WM reached for %s/%s", d.Name, intfConf.Name)
 			var overridesToRemove []PrefixRate
 			totBpsAdded := 0
@@ -220,7 +225,7 @@ func (c *Controller) monitorLoop(d *Device, intfConf InterfaceConfig) {
 
 		// figure out if any of the prefixes needs to be split due to threshold limit
 		for _, pr := range top5Prefixes {
-			c.SplitPrefixes(rip, ifindex, intfConf.PerPrefixThreshold, pr, &finalPrefixes)
+			c.SplitPrefixes(rip, ifindex, intfConf.PerPrefixThreshold, pr, pr, &finalPrefixes)
 		}
 		glog.V(2).Infof("Final Prefixes: %v", finalPrefixes)
 		for _, pr := range finalPrefixes {
@@ -230,9 +235,7 @@ func (c *Controller) monitorLoop(d *Device, intfConf InterfaceConfig) {
 			}
 			totalBpsDetoured += pr.RateBps
 			glog.V(2).Infof("Will detour Prefix: %v", pr)
-			if !intfConf.DryRun {
-				devIntf.Overrides = append(devIntf.Overrides, pr)
-			}
+			devIntf.Overrides = append(devIntf.Overrides, pr)
 			if (utilBps - totalBpsDetoured) < (intfConf.HighWaterMark / 100 * speedBps) {
 				glog.Infof("Detouring total of %d bps off interface %s:%s (util %d, hwm %d)",
 					totalBpsDetoured,
@@ -244,10 +247,6 @@ func (c *Controller) monitorLoop(d *Device, intfConf InterfaceConfig) {
 				break
 			}
 		}
-		if intfConf.DryRun {
-			glog.Info("Dry-run mode, skipping actual detour")
-			continue
-		}
 		c.AddOverrides(d, intfConf, devIntf.Overrides)
 	}
 }
@@ -258,14 +257,14 @@ func (c *Controller) SplitPrefixes(
 	rip RouterIP,
 	i IfIndex,
 	thres int,
-	pr PrefixRate,
+	pr, cr PrefixRate,
 	finalPrefixes *[]PrefixRate,
 ) {
-	if pr.RateBps <= thres {
-		*finalPrefixes = append(*finalPrefixes, pr)
+	if cr.RateBps <= thres {
+		*finalPrefixes = append(*finalPrefixes, cr)
 		return
 	}
-	subnets, err := ipam.Split(*pr.Prefix, 2)
+	subnets, err := ipam.Split(*cr.Prefix, 2)
 	if err != nil {
 		glog.Error(err)
 		return
@@ -276,7 +275,7 @@ func (c *Controller) SplitPrefixes(
 	}
 	for _, childPr := range c.SflowServer.ChildPrefixRates(
 		rip, i, Prefix(pr.Prefix.String()), children, 1*time.Minute) {
-		c.SplitPrefixes(rip, i, thres, childPr, finalPrefixes)
+		c.SplitPrefixes(rip, i, thres, pr, childPr, finalPrefixes)
 	}
 }
 
@@ -305,7 +304,7 @@ func (c *Controller) AddOverrides(d *Device, conf InterfaceConfig, overrides []P
 				var found bool
 				// skip the current best path
 				for _, n := range intf.Nets {
-					if n.Contains(net.ParseIP(p.nh)) {
+					if n.Contains(net.ParseIP(p.Nh)) {
 						found = true
 						break
 					}
@@ -322,11 +321,15 @@ func (c *Controller) AddOverrides(d *Device, conf InterfaceConfig, overrides []P
 					glog.Warningf("Detour candidate %s has no capacity", intf.Name)
 					continue
 				}
-				glog.Infof("Detouring %d bps for prefix %s to interface %s (nh %s)", o.RateBps, pfxStr, intf.Name, p.nh)
-				p.prefix = pfxStr
-				p.lp = 500 // inject with a high LP
-				p.origin = ORIGIN_IGP
-				p.communities = append(p.communities, d.BgpCommunity)
+				glog.Infof("Detouring %d bps for prefix %s to interface %s (nh %s)", o.RateBps, pfxStr, intf.Name, p.Nh)
+				if conf.DryRun {
+					glog.Info("Dry-run mode, skipping actual detour")
+					break
+				}
+				p.Prefix = pfxStr
+				p.Lp = 500 // inject with a high LP
+				p.Origin = ORIGIN_IGP
+				p.Communities = append(p.Communities, d.BgpCommunity)
 				if _, err := c.BgpServer.AddPath(context.Background(), &api.AddPathRequest{Path: bgpRouteToApiPath(p)}); err != nil {
 					glog.Error(err)
 				}
@@ -346,8 +349,8 @@ func (c *Controller) RemoveOverrides(overrides []PrefixRate) error {
 			return fmt.Errorf("No paths found for override: %v", o.Prefix.String())
 		}
 		best := SortPaths(paths, false, true)
-		best[0].lp = 500
-		best[0].origin = ORIGIN_IGP
+		best[0].Lp = 500
+		best[0].Origin = ORIGIN_IGP
 		glog.V(2).Infof("Removing override: %s, bps: %d", o.Prefix.String(), o.RateBps)
 		if err := c.BgpServer.DeletePath(context.Background(), &api.DeletePathRequest{Path: bgpRouteToApiPath(best[0])}); err != nil {
 			return err
@@ -359,9 +362,10 @@ func (c *Controller) RemoveOverrides(overrides []PrefixRate) error {
 func (c *Controller) getBgpPaths(prefix string) ([]BgpRoute, error) {
 	prefixes := []*api.TableLookupPrefix{&api.TableLookupPrefix{Prefix: prefix}}
 	lpr := &api.ListPathRequest{
-		TableType: api.TableType_GLOBAL,
-		Family:    &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST},
-		Prefixes:  prefixes,
+		TableType:      api.TableType_GLOBAL,
+		Family:         &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST},
+		Prefixes:       prefixes,
+		EnableFiltered: true,
 	}
 	var routes []BgpRoute
 	var err error
@@ -372,8 +376,8 @@ func (c *Controller) getBgpPaths(prefix string) ([]BgpRoute, error) {
 				err = errr
 				return
 			}
-			if route.prefix == "" {
-				route.prefix = d.Prefix
+			if route.Prefix == "" {
+				route.Prefix = d.Prefix
 			}
 			routes = append(routes, route)
 		}
@@ -390,17 +394,19 @@ func (c *Controller) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rip := RouterIP(dev.IP.String())
-	intf, _ := queries["interface"]
+	intf, ok := queries["interface"]
 	var ifIndex int
-	for _, i := range dev.Interfaces {
-		if i.Name == intf[0] {
-			ifIndex = i.IfIndex
-			break
+	if ok {
+		for _, i := range dev.Interfaces {
+			if i.Name == intf[0] {
+				ifIndex = i.IfIndex
+				break
+			}
 		}
-	}
-	if ifIndex == 0 {
-		http.Error(w, "Interface not found", http.StatusNotFound)
-		return
+		if ifIndex == 0 {
+			http.Error(w, "Interface not found", http.StatusNotFound)
+			return
+		}
 	}
 	ii := IfIndex(ifIndex)
 	interval := "1m"
@@ -454,7 +460,7 @@ func (c *Controller) handleQuery(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("Cant get bgp paths: %v", err), http.StatusInternalServerError)
 			return
 		}
-		SortPaths(paths, false, ok)
+		paths = SortPaths(paths, false, ok)
 		json.NewEncoder(w).Encode(paths)
 	}
 }
