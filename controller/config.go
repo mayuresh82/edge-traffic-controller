@@ -38,6 +38,7 @@ type DeviceConfig struct {
 	IP           net.IP `yaml:"ip"`
 	ASN          int    `yaml:"asn"`
 	BgpCommunity string `yaml:"bgp_community"`
+	DetourLogic  string
 	Interfaces   []InterfaceConfig
 }
 

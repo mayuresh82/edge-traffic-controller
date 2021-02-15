@@ -28,20 +28,28 @@ const (
 )
 
 type BgpRoute struct {
-	Prefix      string
-	Nh          string
-	Lp          int
-	AsPath      []int `json:"as_path"`
-	Origin      Origin
-	Med         int
-	BgpType     BgpType `json:"bgp_type"`
-	Communities []string
-	MpCandidate bool `json:"mp_candidate"`
+	Prefix       string
+	Nh           string
+	Lp           int
+	AsPath       []int `json:"as_path"`
+	Origin       Origin
+	Med          int
+	BgpType      BgpType `json:"bgp_type"`
+	Communities  []string
+	MpCandidate  bool   `json:"mp_candidate"`
+	ParentPrefix string `json:"parent"`
 }
 
 // stripped down version of BGP bestpath algorithm
 func SortPaths(paths []BgpRoute, multiPath bool, bestPath bool) []BgpRoute {
 	sort.Slice(paths, func(i, j int) bool {
+		_, n1, _ := net.ParseCIDR(paths[i].Prefix)
+		_, n2, _ := net.ParseCIDR(paths[j].Prefix)
+		s1, _ := n1.Mask.Size()
+		s2, _ := n2.Mask.Size()
+		if s1 > s2 {
+			return true
+		}
 		if paths[i].Lp > paths[j].Lp {
 			return true
 		}
@@ -57,7 +65,6 @@ func SortPaths(paths []BgpRoute, multiPath bool, bestPath bool) []BgpRoute {
 		if multiPath {
 			paths[i].MpCandidate = true
 			paths[j].MpCandidate = true
-			return true
 		}
 		return false
 	})

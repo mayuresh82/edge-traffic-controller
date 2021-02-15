@@ -22,7 +22,14 @@ import (
 var (
 	configFile       = flag.String("config", "", "Path to config file")
 	httpAddr         = flag.String("http_addr", ":8080", "HTTP Server Addr")
-	MONITOR_INTERVAL = 1 * time.Minute
+	MONITOR_INTERVAL = 2 * time.Minute
+)
+
+const (
+	// serial detour simply detours prefixes in the same range one by one
+	DetourLogic_Serial = iota
+	// spread detour attempts to spread the detour over multiple prefix ranges
+	DetourLogic_Spread
 )
 
 type Device struct {
@@ -31,6 +38,7 @@ type Device struct {
 	Interfaces   map[string]*Interface
 	Peered       bool
 	BgpCommunity string
+	DetourLogic  int
 }
 
 type Interface struct {
@@ -38,12 +46,12 @@ type Interface struct {
 	SpeedBps  int
 	Nets      []*net.IPNet
 	IfIndex   int
-	Overrides []PrefixRate
+	Overrides map[string]BgpRoute
 }
 
 func (i *Interface) HasOverride(prefix *net.IPNet) bool {
 	for _, o := range i.Overrides {
-		if o.Prefix.String() == prefix.String() {
+		if o.Prefix == prefix.String() {
 			return true
 		}
 	}
@@ -91,7 +99,10 @@ func NewController(config *Config) *Controller {
 	for _, d := range config.Devices {
 		dev := &Device{
 			Name: d.Name, IP: d.IP, Interfaces: make(map[string]*Interface),
-			BgpCommunity: d.BgpCommunity,
+			BgpCommunity: d.BgpCommunity, DetourLogic: DetourLogic_Serial,
+		}
+		if d.DetourLogic == "spread" {
+			dev.DetourLogic = DetourLogic_Spread
 		}
 		for _, ds := range neighborDefinedSets(dev) {
 			if err := s.AddDefinedSet(ctx, &api.AddDefinedSetRequest{DefinedSet: ds}); err != nil {
@@ -188,17 +199,23 @@ func (c *Controller) monitorLoop(d *Device, intfConf InterfaceConfig) {
 		// This might occur if interface util has fallen below the low watermark
 		if percentUtil <= intfConf.LowWaterMark {
 			glog.Infof("Low WM reached for %s/%s", d.Name, intfConf.Name)
-			var overridesToRemove []PrefixRate
+			var overridesToRemove []BgpRoute
 			totBpsAdded := 0
-			for _, o := range devIntf.Overrides {
-				if totBpsAdded+o.RateBps >= intfConf.HighWaterMark/100*speedBps {
+			for prefix, o := range devIntf.Overrides {
+				// recompute prefixRate for old override since that may have changed
+				cpr := c.SflowServer.ChildPrefixRates(rip, ifindex, Prefix(o.ParentPrefix), []Prefix{Prefix(o.Prefix)}, 1*time.Minute)
+				_, ipn, _ := net.ParseCIDR(o.Prefix)
+				newPrefixRate := PrefixRate{Prefix: ipn}
+				if len(cpr) > 0 {
+					newPrefixRate = cpr[0]
+				}
+				if utilBps+newPrefixRate.RateBps >= int(float64(intfConf.HighWaterMark)/100*float64(speedBps)) {
 					break
 				}
-				// recompute prefixRate for old override since that may have changed
-				newPrefixRate := c.SflowServer.PrefixUtil(rip, ifindex, Prefix(o.Prefix.String()), 1*time.Minute)
 				totBpsAdded += newPrefixRate.RateBps
 				glog.V(2).Infof("Removing previous override: %v", newPrefixRate)
-				overridesToRemove = append(overridesToRemove, newPrefixRate)
+				delete(devIntf.Overrides, prefix)
+				overridesToRemove = append(overridesToRemove, o)
 			}
 			if len(overridesToRemove) > 0 {
 				glog.Infof("Adding back total %d bps", totBpsAdded)
@@ -220,23 +237,31 @@ func (c *Controller) monitorLoop(d *Device, intfConf InterfaceConfig) {
 			continue
 		}
 
-		var finalPrefixes []PrefixRate
+		var finalPrefixes [][]PrefixRate
 		var totalBpsDetoured int
 
 		// figure out if any of the prefixes needs to be split due to threshold limit
 		for _, pr := range top5Prefixes {
-			c.SplitPrefixes(rip, ifindex, intfConf.PerPrefixThreshold, pr, pr, &finalPrefixes)
+			var splitPrefixes []PrefixRate
+			c.SplitPrefixes(rip, ifindex, intfConf.PerPrefixThreshold, pr, pr, &splitPrefixes)
+			finalPrefixes = append(finalPrefixes, splitPrefixes)
 		}
 		glog.V(2).Infof("Final Prefixes: %v", finalPrefixes)
-		for _, pr := range finalPrefixes {
+
+		for _, pr := range c.orderDetourPrefixes(d.DetourLogic, finalPrefixes) {
 			if devIntf.HasOverride(pr.Prefix) {
 				glog.V(2).Infof("Prefix %s is already detoured, skipping", pr.Prefix.String())
 				continue
 			}
 			totalBpsDetoured += pr.RateBps
 			glog.V(2).Infof("Will detour Prefix: %v", pr)
-			devIntf.Overrides = append(devIntf.Overrides, pr)
-			if (utilBps - totalBpsDetoured) < (intfConf.HighWaterMark / 100 * speedBps) {
+			// inject override with higher LP
+			override := BgpRoute{Prefix: pr.Prefix.String(), Lp: 500, Origin: ORIGIN_IGP}
+			override.Communities = append(override.Communities, d.BgpCommunity)
+			override.ParentPrefix = c.getParentPrefix(top5Prefixes, *pr.Prefix)
+			c.AddOverrides(d, intfConf, &override)
+			devIntf.Overrides[override.Prefix] = override
+			if (utilBps - totalBpsDetoured) < int(float64(intfConf.HighWaterMark)/100*float64(speedBps)) {
 				glog.Infof("Detouring total of %d bps off interface %s:%s (util %d, hwm %d)",
 					totalBpsDetoured,
 					d.Name,
@@ -247,8 +272,49 @@ func (c *Controller) monitorLoop(d *Device, intfConf InterfaceConfig) {
 				break
 			}
 		}
-		c.AddOverrides(d, intfConf, devIntf.Overrides)
 	}
+}
+
+func (c *Controller) getParentPrefix(parentList []PrefixRate, childPrefix net.IPNet) string {
+	for _, parent := range parentList {
+		_, ipnet, _ := net.ParseCIDR(parent.Prefix.String())
+		if ipam.Contains(*ipnet, childPrefix) {
+			return parent.Prefix.String()
+		}
+	}
+	glog.Warningf("Failed to get parent for child prefix %s", childPrefix)
+	return ""
+}
+
+func (c *Controller) orderDetourPrefixes(
+	detourLogic int,
+	candidates [][]PrefixRate,
+) []PrefixRate {
+	pr := []PrefixRate{}
+	if detourLogic == DetourLogic_Serial {
+		for _, cand := range candidates {
+			for _, c := range cand {
+				pr = append(pr, c)
+			}
+		}
+	}
+	if detourLogic == DetourLogic_Spread {
+		maxlen := 0
+		for _, v := range candidates {
+			if maxlen < len(v) {
+				maxlen = len(v)
+			}
+		}
+		for i := 0; i < maxlen; i++ {
+			for _, list := range candidates {
+				if i >= len(list) {
+					continue
+				}
+				pr = append(pr, list[i])
+			}
+		}
+	}
+	return pr
 }
 
 // SplitPrefixes recursively splits the given prefix into smaller chunks
@@ -280,79 +346,68 @@ func (c *Controller) SplitPrefixes(
 }
 
 // AddOverrides sends bgp overrides to the devices to detour prefixes
-func (c *Controller) AddOverrides(d *Device, conf InterfaceConfig, overrides []PrefixRate) {
+func (c *Controller) AddOverrides(d *Device, conf InterfaceConfig, o *BgpRoute) {
 	glog.V(2).Infof("Adding overrides for device: %s, intf: %s", d.Name, conf.Name)
 	rip := RouterIP(d.IP.String())
-	for _, o := range overrides {
-		pfxStr := o.Prefix.String()
-		// get all available routes for the prefix. This depends on bgp add-path
-		// to be enabled
-		paths, err := c.getBgpPaths(pfxStr)
-		if err != nil {
-			glog.Errorf("Failed to get paths for prefix: %s: %v", pfxStr, err)
+	// get all available routes for the prefix. This depends on bgp add-path
+	// to be enabled
+	paths, err := c.getBgpPaths(o.Prefix)
+	if err != nil {
+		glog.Errorf("Failed to get paths for prefix: %s: %v", o.Prefix, err)
+		return
+	}
+	sorted := SortPaths(paths, false, false)
+	// need at least one more path to detour to !
+	if len(sorted) < 2 {
+		glog.Errorf("Found no detour paths for prefix %s", o.Prefix)
+		return
+	}
+	glog.Infof("Found %d total paths for prefix %s", len(sorted), o.Prefix)
+	for _, intf := range d.Interfaces {
+		// skip the current best interface
+		if intf.IfIndex == conf.IfIndex {
 			continue
 		}
-		sorted := SortPaths(paths, false, false)
-		// need at least one more path to detour to !
-		if len(sorted) < 2 {
-			glog.Errorf("Found no detour paths for prefix %s", pfxStr)
+		// make sure the detour interface has enough capacity
+		bps := c.SflowServer.InterfaceUtil(rip, IfIndex(intf.IfIndex), 1*time.Minute)
+		if int(bps/intf.SpeedBps*100) >= conf.HighWaterMark {
+			glog.Warningf("Detour candidate %s has no capacity", intf.Name)
 			continue
 		}
-		glog.Infof("Found %d total paths for prefix %s", len(sorted), pfxStr)
 		for _, p := range sorted {
-			for _, intf := range d.Interfaces {
-				var found bool
-				// skip the current best path
-				for _, n := range intf.Nets {
-					if n.Contains(net.ParseIP(p.Nh)) {
-						found = true
-						break
-					}
-				}
-				if !found {
-					continue
-				}
-				if intf.IfIndex == conf.IfIndex {
-					continue
-				}
-				// make sure the detour interface has enough capacity
-				bps := c.SflowServer.InterfaceUtil(rip, IfIndex(intf.IfIndex), 1*time.Minute)
-				if int(bps/intf.SpeedBps*100) >= conf.HighWaterMark {
-					glog.Warningf("Detour candidate %s has no capacity", intf.Name)
-					continue
-				}
-				glog.Infof("Detouring %d bps for prefix %s to interface %s (nh %s)", o.RateBps, pfxStr, intf.Name, p.Nh)
-				if conf.DryRun {
-					glog.Info("Dry-run mode, skipping actual detour")
+			// check if path points to current best interface
+			var found bool
+			for _, n := range intf.Nets {
+				if n.Contains(net.ParseIP(p.Nh)) {
+					found = true
 					break
 				}
-				p.Prefix = pfxStr
-				p.Lp = 500 // inject with a high LP
-				p.Origin = ORIGIN_IGP
-				p.Communities = append(p.Communities, d.BgpCommunity)
-				if _, err := c.BgpServer.AddPath(context.Background(), &api.AddPathRequest{Path: bgpRouteToApiPath(p)}); err != nil {
-					glog.Error(err)
-				}
-				break
 			}
+			if !found {
+				continue
+			}
+			glog.Infof("Detouring prefix %s to interface %s (nh %s)", o.Prefix, intf.Name, p.Nh)
+			if conf.DryRun {
+				glog.Info("Dry-run mode, skipping actual detour")
+				return
+			}
+			o.AsPath = append(o.AsPath, p.AsPath...)
+			o.Med = p.Med
+			o.Nh = p.Nh
+			if _, err := c.BgpServer.AddPath(context.Background(), &api.AddPathRequest{Path: bgpRouteToApiPath(*o)}); err != nil {
+				glog.Error(err)
+				continue
+			}
+			// detour successful
+			return
 		}
 	}
 }
 
-func (c *Controller) RemoveOverrides(overrides []PrefixRate) error {
+func (c *Controller) RemoveOverrides(overrides []BgpRoute) error {
 	for _, o := range overrides {
-		paths, err := c.getBgpPaths(o.Prefix.String())
-		if err != nil {
-			return err
-		}
-		if len(paths) == 0 {
-			return fmt.Errorf("No paths found for override: %v", o.Prefix.String())
-		}
-		best := SortPaths(paths, false, true)
-		best[0].Lp = 500
-		best[0].Origin = ORIGIN_IGP
-		glog.V(2).Infof("Removing override: %s, bps: %d", o.Prefix.String(), o.RateBps)
-		if err := c.BgpServer.DeletePath(context.Background(), &api.DeletePathRequest{Path: bgpRouteToApiPath(best[0])}); err != nil {
+		glog.V(2).Infof("Removing override: %s -> %s", o.Prefix, o.Nh)
+		if err := c.BgpServer.DeletePath(context.Background(), &api.DeletePathRequest{Path: bgpRouteToApiPath(o)}); err != nil {
 			return err
 		}
 	}
@@ -360,7 +415,8 @@ func (c *Controller) RemoveOverrides(overrides []PrefixRate) error {
 }
 
 func (c *Controller) getBgpPaths(prefix string) ([]BgpRoute, error) {
-	prefixes := []*api.TableLookupPrefix{&api.TableLookupPrefix{Prefix: prefix}}
+	prefixes := []*api.TableLookupPrefix{
+		&api.TableLookupPrefix{Prefix: prefix, LookupOption: api.TableLookupOption_LOOKUP_SHORTER}}
 	lpr := &api.ListPathRequest{
 		TableType:      api.TableType_GLOBAL,
 		Family:         &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST},
@@ -446,7 +502,7 @@ func (c *Controller) handleQuery(w http.ResponseWriter, r *http.Request) {
 		prefixUtil := c.SflowServer.PrefixUtil(rip, ii, parent, dur)
 		json.NewEncoder(w).Encode(prefixUtil)
 	case "overrides":
-		devIntf, ok := dev.Interfaces["intf"]
+		devIntf, ok := dev.Interfaces[intf[0]]
 		if !ok {
 			http.Error(w, "Interface not found", http.StatusNotFound)
 			return
@@ -454,13 +510,14 @@ func (c *Controller) handleQuery(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(devIntf.Overrides)
 	case "bgppaths":
 		prefix := queries["prefix"][0]
-		_, ok := queries["best"]
+		_, best := queries["best"]
+		_, mp := queries["mp"]
 		paths, err := c.getBgpPaths(prefix)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Cant get bgp paths: %v", err), http.StatusInternalServerError)
 			return
 		}
-		paths = SortPaths(paths, false, ok)
+		paths = SortPaths(paths, mp, best)
 		json.NewEncoder(w).Encode(paths)
 	}
 }

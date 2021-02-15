@@ -84,7 +84,7 @@ func (s *SflowServer) processSamples() {
 			if len(buf.samples) > 0 {
 				if sample.Ts.Sub(buf.lastFsTs) >= WINDOW_SIZE*2 {
 					// truncate the window by half
-					glog.V(4).Infof("Pre Trunc: %d samples", len(buf.samples))
+					glog.V(6).Infof("Pre Trunc: %d samples", len(buf.samples))
 					truncIdx := 0
 					for i, sm := range buf.samples {
 						if sm.Ts.Sub(buf.lastFsTs) >= WINDOW_SIZE {
@@ -92,10 +92,10 @@ func (s *SflowServer) processSamples() {
 							break
 						}
 					}
-					glog.V(4).Infof("Trunc FS: sampleTS: %v, lastFsTs: %v, truncIdx: %d",
+					glog.V(6).Infof("Trunc FS: sampleTS: %v, lastFsTs: %v, truncIdx: %d",
 						sample.Ts, buf.lastFsTs, truncIdx)
 					buf.samples = buf.samples[truncIdx:]
-					glog.V(4).Infof("Post Trunc: %d samples", len(buf.samples))
+					glog.V(6).Infof("Post Trunc: %d samples", len(buf.samples))
 					buf.lastFsTs = sample.Ts
 				}
 			}
