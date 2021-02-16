@@ -12,7 +12,7 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
 
     re_name  = ( "vqfx" + id.to_s ).to_sym
     pfe_name = ( "vqfx" + id.to_s + "-pfe" ).to_sym
-    eos_name = ( "veos" + id.to_s ).to_sym
+    cum_name = ( "cumos" + id.to_s ).to_sym
 
     ##############################
     ## Packet Forwarding Engine ##
@@ -52,29 +52,29 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     end
 
     ##########################
-    ## EOS            #######
+    ## CUMULUS         #######
     ##########################
-    config.vm.define eos_name do |eos|
-        eos.vm.hostname = "eos#{id}"
-        eos.vm.box = "arista/veos"
+    config.vm.define cum_name do |cumos|
+        cumos.vm.hostname = "cumos#{id}"
+        cumos.vm.box = "cumulus/vx"
 
         # Turn off shared folders
-        eos.vm.synced_folder ".", "/vagrant", disabled: true 
+        cumos.vm.synced_folder ".", "/vagrant", disabled: true 
 
-        eos.vm.network :forwarded_port, guest: 22, host: 12201, id: 'ssh'
-		eos.vm.network :forwarded_port, guest: 80, host: 18080, id: 'http'
+        cumos.vm.network :forwarded_port, guest: 22, host: 12201, id: 'ssh'
+		cumos.vm.network :forwarded_port, guest: 8080, host: 18080, id: 'http'
 
         # Dataplane ports
         (1..2).each do |seg_id|
-           eos.vm.network 'private_network', auto_config: false, nic_type: '82540EM', virtualbox__intnet: "#{UUID}_seg#{seg_id}"
+           cumos.vm.network 'private_network', auto_config: false, nic_type: '82540EM', virtualbox__intnet: "#{UUID}_seg#{seg_id}"
         end
 
         # Dataplane ports - server facing
          (3..4).each do |seg_id|
-            eos.vm.network 'private_network', auto_config: false, nic_type: '82540EM', virtualbox__intnet: "HOST_seg#{seg_id}"
+            cumos.vm.network 'private_network', auto_config: false, nic_type: '82540EM', virtualbox__intnet: "HOST_seg#{seg_id}"
         end
 
-		eos.vm.provider "virtualbox" do |v|
+		cumos.vm.provider "virtualbox" do |v|
             v.customize ["modifyvm", :id, "--nicpromisc4", "allow-all"]
             v.customize ["modifyvm", :id, "--nicpromisc5", "allow-all"]
         end

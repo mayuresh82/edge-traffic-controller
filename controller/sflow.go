@@ -13,7 +13,7 @@ import (
 )
 
 var WINDOW_SIZE = 1 * time.Minute
-var CLEANUP_INTERVAL = 2 * time.Minute
+var CLEANUP_INTERVAL = 1 * time.Minute
 
 type SflowServer struct {
 	// buffer of flow samples per destination prefix per interface per router
