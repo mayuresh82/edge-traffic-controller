@@ -25,17 +25,21 @@ type InterfaceConfig struct {
 	Name               string
 	IfIndex            int `yaml:"ifindex"`
 	Speed              int
+	Address            string
 	HighWaterMark      int  `yaml:"high_watermark"`
 	LowWaterMark       int  `yaml:"low_watermark"`
 	PerPrefixThreshold int  `yaml:"per_prefix_threshold"`
 	DryRun             bool `yaml:"dry_run"`
+	Monitor            bool
 }
 
 type DeviceConfig struct {
-	Name       string
-	IP         net.IP `yaml:"ip"`
-	ASN        int    `yaml:"asn"`
-	Interfaces []InterfaceConfig
+	Name         string
+	IP           net.IP `yaml:"ip"`
+	ASN          int    `yaml:"asn"`
+	BgpCommunity string `yaml:"bgp_community"`
+	DetourLogic  string
+	Interfaces   []InterfaceConfig
 }
 
 type Config struct {

@@ -13,7 +13,7 @@ import (
 )
 
 var WINDOW_SIZE = 1 * time.Minute
-var CLEANUP_INTERVAL = 2 * time.Minute
+var CLEANUP_INTERVAL = 1 * time.Minute
 
 type SflowServer struct {
 	// buffer of flow samples per destination prefix per interface per router
@@ -84,7 +84,7 @@ func (s *SflowServer) processSamples() {
 			if len(buf.samples) > 0 {
 				if sample.Ts.Sub(buf.lastFsTs) >= WINDOW_SIZE*2 {
 					// truncate the window by half
-					glog.V(4).Infof("Pre Trunc: %d samples", len(buf.samples))
+					glog.V(6).Infof("Pre Trunc: %d samples", len(buf.samples))
 					truncIdx := 0
 					for i, sm := range buf.samples {
 						if sm.Ts.Sub(buf.lastFsTs) >= WINDOW_SIZE {
@@ -92,10 +92,10 @@ func (s *SflowServer) processSamples() {
 							break
 						}
 					}
-					glog.V(4).Infof("Trunc FS: sampleTS: %v, lastFsTs: %v, truncIdx: %d",
+					glog.V(6).Infof("Trunc FS: sampleTS: %v, lastFsTs: %v, truncIdx: %d",
 						sample.Ts, buf.lastFsTs, truncIdx)
 					buf.samples = buf.samples[truncIdx:]
-					glog.V(4).Infof("Post Trunc: %d samples", len(buf.samples))
+					glog.V(6).Infof("Post Trunc: %d samples", len(buf.samples))
 					buf.lastFsTs = sample.Ts
 				}
 			}
@@ -188,7 +188,7 @@ func (s *SflowServer) processPacket() {
 				case layers.SFlowRawPacketFlowRecord:
 					sample.PacketSizeBytes = int(fr.FrameLength)
 					if err := fr.Header.ErrorLayer(); err != nil {
-						glog.Errorf("Error decoding some part of the packet:", err)
+						glog.Errorf("Error decoding some part of the packet: %v", err)
 					}
 					if ipLayer := fr.Header.Layer(layers.LayerTypeIPv4); ipLayer != nil {
 						ipHdr, _ := ipLayer.(*layers.IPv4)
@@ -238,6 +238,19 @@ func (s *SflowServer) TopNPrefixesByRate(n int, routerIP RouterIP, ifIndex IfInd
 		return prefixRates
 	}
 	return prefixRates[:n]
+}
+
+func (s *SflowServer) PrefixUtil(routerIP RouterIP, ifIndex IfIndex, prefix Prefix, interval time.Duration) PrefixRate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	intfSamples, ok := s.samplesPerPrefix[routerIP][ifIndex]
+	if !ok {
+		glog.V(2).Infof("No samples found for %s / %d", routerIP, ifIndex)
+		return PrefixRate{}
+	}
+	prefixSamples := intfSamples[prefix]
+	_, ipnet, _ := net.ParseCIDR(string(prefix))
+	return PrefixRate{Prefix: ipnet, RateBps: prefixSamples.samples.Rate(interval)}
 }
 
 // ChildPrefixRates returns prefix rates for the children of a given parent prefix
