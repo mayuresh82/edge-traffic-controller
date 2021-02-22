@@ -46,7 +46,7 @@ type Interface struct {
 	SpeedBps  int
 	Nets      []*net.IPNet
 	IfIndex   int
-	Overrides map[string]BgpRoute
+	Overrides map[string]Override
 }
 
 func (i *Interface) HasOverride(prefix *net.IPNet) bool {
@@ -149,6 +149,7 @@ func (c *Controller) Start() {
 		for _, intConf := range devConf.Interfaces {
 			intf := &Interface{
 				Name: intConf.Name, SpeedBps: intConf.Speed, IfIndex: intConf.IfIndex,
+				Overrides: make(map[string]Override),
 			}
 			_, ipnet, err := net.ParseCIDR(intConf.Address)
 			if err != nil {
@@ -199,11 +200,11 @@ func (c *Controller) monitorLoop(d *Device, intfConf InterfaceConfig) {
 		// This might occur if interface util has fallen below the low watermark
 		if percentUtil <= intfConf.LowWaterMark {
 			glog.Infof("Low WM reached for %s/%s", d.Name, intfConf.Name)
-			var overridesToRemove []BgpRoute
+			var overridesToRemove []Override
 			totBpsAdded := 0
 			for prefix, o := range devIntf.Overrides {
 				// recompute prefixRate for old override since that may have changed
-				cpr := c.SflowServer.ChildPrefixRates(rip, ifindex, Prefix(o.ParentPrefix), []Prefix{Prefix(o.Prefix)}, 1*time.Minute)
+				cpr := c.SflowServer.ChildPrefixRates(rip, o.OutIfIndex, Prefix(o.ParentPrefix), []Prefix{Prefix(o.Prefix)}, 1*time.Minute)
 				_, ipn, _ := net.ParseCIDR(o.Prefix)
 				newPrefixRate := PrefixRate{Prefix: ipn}
 				if len(cpr) > 0 {
@@ -256,9 +257,14 @@ func (c *Controller) monitorLoop(d *Device, intfConf InterfaceConfig) {
 			totalBpsDetoured += pr.RateBps
 			glog.V(2).Infof("Will detour Prefix: %v", pr)
 			// inject override with higher LP
-			override := BgpRoute{Prefix: pr.Prefix.String(), Lp: 500, Origin: ORIGIN_IGP}
-			override.Communities = append(override.Communities, d.BgpCommunity)
-			override.ParentPrefix = c.getParentPrefix(top5Prefixes, *pr.Prefix)
+			route := BgpRoute{Prefix: pr.Prefix.String(), Lp: 500, Origin: ORIGIN_IGP}
+			route.Communities = append(route.Communities, d.BgpCommunity)
+			override := Override{
+				Prefix:       pr.Prefix.String(),
+				RateBps:      pr.RateBps,
+				ParentPrefix: c.getParentPrefix(top5Prefixes, *pr.Prefix),
+				Route:        route,
+			}
 			c.AddOverrides(d, intfConf, &override)
 			devIntf.Overrides[override.Prefix] = override
 			if (utilBps - totalBpsDetoured) < int(float64(intfConf.HighWaterMark)/100*float64(speedBps)) {
@@ -346,7 +352,7 @@ func (c *Controller) SplitPrefixes(
 }
 
 // AddOverrides sends bgp overrides to the devices to detour prefixes
-func (c *Controller) AddOverrides(d *Device, conf InterfaceConfig, o *BgpRoute) {
+func (c *Controller) AddOverrides(d *Device, conf InterfaceConfig, o *Override) {
 	glog.V(2).Infof("Adding overrides for device: %s, intf: %s", d.Name, conf.Name)
 	rip := RouterIP(d.IP.String())
 	// get all available routes for the prefix. This depends on bgp add-path
@@ -391,10 +397,11 @@ func (c *Controller) AddOverrides(d *Device, conf InterfaceConfig, o *BgpRoute) 
 				glog.Info("Dry-run mode, skipping actual detour")
 				return
 			}
-			o.AsPath = append(o.AsPath, p.AsPath...)
-			o.Med = p.Med
-			o.Nh = p.Nh
-			if _, err := c.BgpServer.AddPath(context.Background(), &api.AddPathRequest{Path: bgpRouteToApiPath(*o)}); err != nil {
+			o.Route.AsPath = append(o.Route.AsPath, p.AsPath...)
+			o.Route.Med = p.Med
+			o.Route.Nh = p.Nh
+			o.OutIfIndex = IfIndex(intf.IfIndex)
+			if _, err := c.BgpServer.AddPath(context.Background(), &api.AddPathRequest{Path: bgpRouteToApiPath(o.Route)}); err != nil {
 				glog.Error(err)
 				continue
 			}
@@ -404,10 +411,10 @@ func (c *Controller) AddOverrides(d *Device, conf InterfaceConfig, o *BgpRoute) 
 	}
 }
 
-func (c *Controller) RemoveOverrides(overrides []BgpRoute) error {
+func (c *Controller) RemoveOverrides(overrides []Override) error {
 	for _, o := range overrides {
-		glog.V(2).Infof("Removing override: %s -> %s", o.Prefix, o.Nh)
-		if err := c.BgpServer.DeletePath(context.Background(), &api.DeletePathRequest{Path: bgpRouteToApiPath(o)}); err != nil {
+		glog.V(2).Infof("Removing override: %s -> %s", o.Prefix, o.Route.Nh)
+		if err := c.BgpServer.DeletePath(context.Background(), &api.DeletePathRequest{Path: bgpRouteToApiPath(o.Route)}); err != nil {
 			return err
 		}
 	}

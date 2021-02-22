@@ -59,11 +59,13 @@ func (f FlowSamples) Rate(aggInterval time.Duration) int {
 	return bps
 }
 
+// Flow sample buffer
 type FsBuf struct {
 	samples  FlowSamples
 	lastFsTs time.Time
 }
 
+// CounterSample represents a single counter sample
 type CounterSample struct {
 	AgentIP   net.IP
 	IfIndex   IfIndex
@@ -94,11 +96,13 @@ func (c CounterSamples) Rate(aggInterval time.Duration) int {
 	return sumBps / len(samplesInInterval)
 }
 
+// Counter sample buffer
 type CsBuf struct {
 	samples  CounterSamples
 	lastCsTs time.Time
 }
 
+// Prefixrate is used to store a prefix and its associated traffic rate
 type PrefixRate struct {
 	Prefix  *net.IPNet
 	RateBps int
@@ -113,4 +117,13 @@ func (p *PrefixRate) MarshalJSON() ([]byte, error) {
 		RateBps: p.RateBps,
 	}
 	return json.Marshal(tmp)
+}
+
+// Override is a route override for a prefix
+type Override struct {
+	Prefix       string
+	RateBps      int    `json:"rate"`
+	ParentPrefix string `json:"parent_prefix"`
+	Route        BgpRoute
+	OutIfIndex   IfIndex `json:"out_ifindex"`
 }
