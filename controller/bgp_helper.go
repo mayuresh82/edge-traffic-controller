@@ -28,16 +28,15 @@ const (
 )
 
 type BgpRoute struct {
-	Prefix       string
-	Nh           string
-	Lp           int
-	AsPath       []int `json:"as_path"`
-	Origin       Origin
-	Med          int
-	BgpType      BgpType `json:"bgp_type"`
-	Communities  []string
-	MpCandidate  bool   `json:"mp_candidate"`
-	ParentPrefix string `json:"parent"`
+	Prefix      string
+	Nh          string
+	Lp          int
+	AsPath      []int `json:"as_path"`
+	Origin      Origin
+	Med         int
+	BgpType     BgpType `json:"bgp_type"`
+	Communities []string
+	MpCandidate bool `json:"mp_candidate"`
 }
 
 // stripped down version of BGP bestpath algorithm
