@@ -17,12 +17,29 @@ import (
 	"github.com/gorilla/mux"
 	api "github.com/osrg/gobgp/api"
 	gobgp "github.com/osrg/gobgp/pkg/server"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
-	configFile       = flag.String("config", "", "Path to config file")
-	httpAddr         = flag.String("http_addr", ":8080", "HTTP Server Addr")
-	MONITOR_INTERVAL = 2 * time.Minute
+	configFile              = flag.String("config", "", "Path to config file")
+	httpAddr                = flag.String("http_addr", ":8080", "HTTP Server Addr")
+	MONITOR_INTERVAL        = 90 * time.Second
+	METRICS_GATHER_INTERVAL = 15 * time.Second
+
+	intfUtilGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "controller_intf_util",
+		Help: "Interface util in bps",
+	}, []string{"router_ip", "interface"})
+	prefixUtilGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "controller_prefix_util",
+		Help: "Per prefix util in bps",
+	}, []string{"router_ip", "interface", "prefix"})
+	intfSpeedGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "controller_intf_speed",
+		Help: "Interfaec speed in bps",
+	}, []string{"router_ip", "interface"})
 )
 
 const (
@@ -145,6 +162,7 @@ func NewController(config *Config) *Controller {
 }
 
 func (c *Controller) Start() {
+	var metricDevs []*Device
 	for _, devConf := range c.Config.Devices {
 		for _, intConf := range devConf.Interfaces {
 			intf := &Interface{
@@ -162,15 +180,41 @@ func (c *Controller) Start() {
 			if intConf.Monitor {
 				go c.monitorLoop(dev, intConf)
 			}
+			metricDevs = append(metricDevs, dev)
 		}
 	}
+	go c.gatherMetrics(metricDevs)
 	glog.Infof("Starting http server on %s", *httpAddr)
 	router := mux.NewRouter()
 	router.HandleFunc("/api/{query}/", c.handleQuery).Methods("GET")
+	router.Handle("/metrics", promhttp.Handler()).Methods("GET")
 	srv := &http.Server{Addr: *httpAddr, Handler: router, WriteTimeout: 10 * time.Second,
 		ReadTimeout: 10 * time.Second}
 	if err := srv.ListenAndServe(); err != nil {
 		glog.Errorf("HTTP server ListenAndServe Error: %v", err)
+	}
+}
+
+func (c *Controller) gatherMetrics(devices []*Device) {
+	for {
+		intfUtilGauge.Reset()
+		prefixUtilGauge.Reset()
+		intfSpeedGauge.Reset()
+		for _, d := range devices {
+			for _, i := range d.Interfaces {
+				rip := RouterIP(d.IP.String())
+				idx := IfIndex(i.IfIndex)
+				util := c.SflowServer.InterfaceUtil(rip, idx, 1*time.Minute)
+				intfUtilGauge.WithLabelValues(d.IP.String(), i.Name).Set(float64(util))
+				for _, pr := range c.SflowServer.TopNPrefixesByRate(5, rip, idx, 1*time.Minute) {
+					prefixUtilGauge.WithLabelValues(
+						d.IP.String(), i.Name, pr.Prefix.String(),
+					).Set(float64(pr.RateBps))
+				}
+				intfSpeedGauge.WithLabelValues(d.IP.String(), i.Name).Set(float64(i.SpeedBps))
+			}
+		}
+		time.Sleep(METRICS_GATHER_INTERVAL)
 	}
 }
 
